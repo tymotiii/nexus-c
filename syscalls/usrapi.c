@@ -35,9 +35,11 @@ void syscall_sleep(int ticks) {
     );
 }
 
-void syscall_exit() {
+void syscall_exit(int exit_code) {
     __asm__ volatile (
-        "movl $4, %eax\n"
+        "movl %0, %%ebx\n"
+        "movl $4, %%eax\n"
         "int $0x80"
+        : : "r"(exit_code) : "ebx"
     );
 }

@@ -59,21 +59,22 @@ ISR_NOERRCODE 128 ; syscalls
 
 isr_common_stub:
     pushad
-
     push ds
     push es
     push fs
     push gs
 
-    mov ax, 0x10    ; Segment danych jądra
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    push esp
+    push esp ; Przekaż wskaźnik do struktury registers
     call interrupt_handler
-    mov esp, eax    ; Przełączenie stosu na (być może) nowy proces
+    mov esp, eax ; <-- CZY MASZ TĘ LINIJKĘ? Jądro MUSI zaktualizować ESP przed powrotem!
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popad
+    add esp, 8 ; Oczyść int_no i err_code
+    iret
 
 ; --- TUTAJ SKACZEMY PRZY PIERWSZYM URUCHOMIENIU ---
 pop_and_iret:

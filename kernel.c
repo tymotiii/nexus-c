@@ -32,6 +32,30 @@ unsigned char inb(unsigned short port) {
 }
 
 // ------[TEXT MODE]-------
+
+// Prosty bufor kołowy (Circular Buffer) dla klawiatury
+#define KBD_BUFFER_SIZE 256
+static char kbd_buffer[KBD_BUFFER_SIZE];
+static int kbd_head = 0;
+static int kbd_tail = 0;
+
+// Funkcja dodająca znak do bufora (wywoływana przez przerwanie)
+void kbd_putc(char c) {
+    int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
+    if (next != kbd_tail) { // Jeśli bufor nie jest pełny
+        kbd_buffer[kbd_head] = c;
+        kbd_head = next;
+    }
+}
+
+// Funkcja wyciągająca znak z bufora (wywoływana przez syscall)
+char kbd_getc() {
+    if (kbd_head == kbd_tail) return 0; // Bufor pusty
+    char c = kbd_buffer[kbd_tail];
+    kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
+    return c;
+}
+
 volatile char *video = (volatile char*)0xB8000;
 volatile char last_char = 0;
 
@@ -96,13 +120,6 @@ void printk(const char *txt) {
 }
 
 // -------[STRUKTURA REJESTRÓW]-------
-// Dopasowana 1:1 do kolejności pushowania rejestrów w sekcji assemblerowej isr_common_stub
-struct registers {
-    unsigned int gs, fs, es, ds;                         // Pchnięte ręcznie w ASM stubie
-    unsigned int edi, esi, ebp, esp, ebx, edx, ecx, eax; // Pchnięte przez PUSHAD
-    unsigned int int_no, err_code;                       // Wepchnięte przez makra ISR
-    unsigned int eip, cs, eflags, useresp, ss;           // Wepchnięte automatycznie przez procesor
-};
 
 // -------[ GDT STRUKTURY ]-------
 struct gdt_entry {
@@ -228,20 +245,21 @@ void _pit_init(unsigned int hz) {
 
 unsigned int page_directory[1024] __attribute__((aligned(4096)));
 unsigned int first_page_table[1024] __attribute__((aligned(4096)));
+unsigned int page_tables[16][1024] __attribute__((aligned(4096))); // <--- ZMIANA: Zmień 4 na 16 (64MB)
+
 
 void _paging_init() {
-    // Wszystkie wpisy w katalogu stron flagujemy jako 0x07 (User Mode dostępny)
-    for(int i = 0; i < 1024; i++) {
-        page_directory[i] = 0x00000007;
+    for(int i = 0; i < 1024; i++) page_directory[i] = 0;
+
+    // Teraz pętla mapuje 64MB (t od 0 do 15)
+    for(int t = 0; t < 16; t++) { // <--- ZMIANA: Zmień t < 4 na t < 16
+        for(unsigned int i = 0; i < 1024; i++) {
+            page_tables[t][i] = (t * 0x400000 + i * 4096) | 7;
+        }
+        page_directory[t] = ((unsigned int)page_tables[t]) | 7;
     }
 
-    // Mapujemy pierwsze 4MB tożsamościowo (0x00000000 - 0x003FFFFF)
-    for(unsigned int i = 0; i < 1024; i++) {
-        first_page_table[i] = (i * 4096) | 7; // Obecny + Do zapisu + User Mode
-    }
-
-    page_directory[0] = ((unsigned int)first_page_table) | 7;
-
+    // Włączenie stronicowania (reszta bez zmian)
     __asm__ volatile("mov %0, %%cr3" : : "r"(page_directory));
     unsigned int cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -314,14 +332,6 @@ unsigned char kbd_us[128] = {
     0,  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',   0,
  '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',   0, '*',   0, ' '
 };
-
-struct task {
-    unsigned int esp;
-    unsigned int page_dir;
-    unsigned int kernel_stack;
-    unsigned int sleep_ticks;
-    unsigned int state;
-} __attribute__((packed));
 
 
 // --- STRUKTURY MULTIBOOT ---
@@ -428,30 +438,28 @@ volatile int scheduler_enabled = 0;
 #define STATE_FREE    0  // Pusty slot w process_table, można tu stworzyć nowy proces
 #define STATE_READY   1  // Proces żyje i chce działać (lub aktualnie działa)
 #define STATE_SLEEP   2
-
-
-
+uint8_t global_task_code_buffers[64][8192]   __attribute__((aligned(4096)));
+uint8_t global_task_kernel_stacks[64][4096] __attribute__((aligned(4096)));
+uint8_t global_task_user_stacks[64][4096]   __attribute__((aligned(4096)));
 
 void _create_user_task(int id, void (*entry_point)()) {
-    static unsigned char task_kstack[64][4096];
-    static unsigned char task_ustack[64][4096];
-
-    unsigned int *stack = (unsigned int *)&task_kstack[id][4092];
+    // Używamy globalnego stosu jądra, koniec bufora (4096 - 4 = 4092)
+    unsigned int *stack = (unsigned int *)&global_task_kernel_stacks[id][4092];
 
     // Kontekst dla iret w Ring 3
-    *(--stack) = 0x23;                                  // SS użytkownika (0x23)
-    *(--stack) = (unsigned int)&task_ustack[id][4092];  // ESP użytkownika
-    *(--stack) = 0x202;                                // EFLAGS: IF=1 (0x200) + IOPL=3 (0x3000) <--- KLUCZ
-    *(--stack) = 0x1B;                                  // CS użytkownika (0x1B)
+    *(--stack) = 0x23;                                  // SS użytkownika
+    *(--stack) = (unsigned int)&global_task_user_stacks[id][4092]; // ESP użytkownika
+    *(--stack) = 0x202;                                 // EFLAGS
+    *(--stack) = 0x1B;                                  // CS użytkownika
     *(--stack) = (unsigned int)entry_point;             // EIP zadania
 
     *(--stack) = 0;  // err_code
     *(--stack) = 32; // int_no
 
-    // Pushad (eax, ecx, edx, ebx, esp, ebp, esi, edi)
+    // Pushad
     for(int i = 0; i < 8; i++) *(--stack) = 0;
 
-    // Segmenty dla rejestrów segmentowych przywracanych przez ASM (gs, fs, es, ds)
+    // Segmenty dla ASM
     *(--stack) = 0x23; // gs
     *(--stack) = 0x23; // fs
     *(--stack) = 0x23; // es
@@ -459,11 +467,89 @@ void _create_user_task(int id, void (*entry_point)()) {
 
     process_table[id].esp = (unsigned int)stack;
     process_table[id].page_dir = (unsigned int)page_directory;
-    process_table[id].kernel_stack = (unsigned int)&task_kstack[id][4092];
+    process_table[id].kernel_stack = (unsigned int)&global_task_kernel_stacks[id][4092];
     process_table[id].state = STATE_READY;
 
     total_tasks++;
 }
+
+int _initrd_load_program(int id, const char* filename) {
+    uint32_t file_size = 0;
+
+    // 1. Odczyt surowych bajtów pliku z InitRD za pomocą VFS
+    char* file_data = vfs_read_file(filename, &file_size);
+
+    if (file_data == 0) {
+        printk("[VFS LOAD] Blad: Nie znaleziono pliku w InitRD: ");
+        printk(filename);
+        printk("\n");
+        return 0; // Porażka
+    }
+
+    // Sprawdzamy limit dedykowanego bufora (8192 bajty = 8KB)
+    if (file_size > 8192) {
+        printk("[VFS LOAD] Blad: Plik jest za duzy na bufor procesu (max 8KB)!\n");
+        return 0; // Porażka
+    }
+
+    if (id < 0 || id >= 64) {
+        printk("[VFS LOAD] Blad: Niepoprawne ID zadania!\n");
+        return 0; // Porażka
+    }
+
+    // 2. Kopiowanie kodu programu do dedykowanego globalnego bufora procesu
+    for (uint32_t i = 0; i < file_size; i++) {
+        global_task_code_buffers[id][i] = (uint8_t)file_data[i];
+    }
+
+    // Punktem wejścia (EIP) dla procesora będzie fizyczny adres początku tego bufora
+    unsigned int entry_point = (unsigned int)&global_task_code_buffers[id][0];
+
+    // 3. Budowanie kontekstu rejestrów na globalnym stosie jądra
+    // Rozmiar stosu jądra to 4096 bajtów, najwyższy wyrównany adres to indeks 4092
+    unsigned int *stack = (unsigned int *)&global_task_kernel_stacks[id][4092];
+
+    // Kontekst dla instrukcji IRET (powrót do Ring 3)
+    *(--stack) = 0x23;                                  // SS użytkownika (Dane Ring 3)
+    *(--stack) = entry_point + 8188;                    // ESP użytkownika (Koniec zmapowanego bufora kodu)
+    *(--stack) = 0x202;                                 // EFLAGS: IF=1 (Włączone przerwania)
+    *(--stack) = 0x1B;                                  // CS użytkownika (Kod Ring 3)
+    *(--stack) = entry_point;                           // EIP zadania (Początek załadowanego kodu)
+
+    // Sztuczne ramki dla obsługi przerwań (kod błędu i numer przerwania)
+    *(--stack) = 0;  // err_code
+    *(--stack) = 32; // int_no (Udaje przerwanie timera przy pierwszym załadowaniu)
+
+    // Pushad (Zgrupowane rejestry uniwersalne: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI)
+    for(int i = 0; i < 8; i++) {
+        *(--stack) = 0;
+    }
+
+    // Segmenty danych przywracane przez assemblerowy stub (GS, FS, ES, DS)
+    *(--stack) = 0x23; // GS
+    *(--stack) = 0x23; // FS
+    *(--stack) = 0x23; // ES
+    *(--stack) = 0x23; // DS
+
+    // 4. Przypisanie gotowego kontekstu i struktur do tabeli procesów
+    process_table[id].esp = (unsigned int)stack;
+    process_table[id].page_dir = (unsigned int)page_directory;
+    process_table[id].kernel_stack = (unsigned int)&global_task_kernel_stacks[id][4092];
+    process_table[id].state = STATE_READY;
+
+    // Wyczyszczenie liczników schedulera dla nowego procesu
+    process_table[id].sleep_ticks = 0;
+    process_table[id].exit_code = 0;
+
+    total_tasks++;
+
+    printk("[VFS LOAD] Pomyslnie dodano proces z pliku: ");
+    printk(filename);
+    printk("\n");
+
+    return 1; // Sukces
+}
+
 
 unsigned int interrupt_handler(struct registers *regs) {
     unsigned int current_esp = (unsigned int)regs;
@@ -543,15 +629,18 @@ unsigned int interrupt_handler(struct registers *regs) {
     // --- KLAWIATURA ---
     if (regs->int_no == 33) {
         unsigned char scancode = inb(0x60);
-        if (!(scancode & 0x80)) {
-            char c = kbd_us[scancode];
-            if (c > 0) {
-                char str[2] = {c, '\0'};
-                printk(str);
+            if (!(scancode & 0x80)) { // Klaiwsz naciśnięty
+                char c = kbd_us[scancode];
+                if (c > 0) {
+                    // 1. Zapisz znak do bufora jądra, żeby sys_read mógł go pobrać
+                    kbd_putc(c);
+
+                    // 2. Opcjonalnie: echo (wypisz znak na ekran, żeby użytkownik widział co pisze)
+                    char str[2] = {c, '\0'};
+                }
             }
-        }
-        outb(0x20, 0x20);
-        return current_esp;
+            outb(0x20, 0x20);
+            return current_esp;
     }
 
     // Obsługa ewentualnych wyjątków (np. jeśli coś poszło nie tak)
@@ -575,7 +664,7 @@ void user_program_1() {
     syscall_print("A");
     syscall_sleep(10000);
     syscall_print("Exiting program A");
-    syscall_exit();
+    syscall_exit(0);
 }
 
 void user_program_2() {
@@ -594,10 +683,30 @@ void user_program_3() {
 extern void pop_and_iret();
 
 // ZMIANA: Zmieniamy sygnaturę _start, aby GRUB podawał parametry bezpośrednio na stosie
-void _start(uint32_t boot_magic, uint32_t boot_mbi_addr) {
+void kmain(uint32_t boot_magic, uint32_t boot_mbi_addr) {
+
+    if (boot_magic == 0x36d76289 || boot_magic == 0x2BADB002) {
+        multiboot_info_t* mbi = (multiboot_info_t*)boot_mbi_addr;
+
+        // Bit 3 w mbi->flags informuje o obecności modułów
+        if (mbi->flags & (1 << 3)) {
+            if (mbi->mods_count > 0) {
+                multiboot_module_t* mod = (multiboot_module_t*)mbi->mods_addr;
+
+                // Montujemy system plików przekazując fizyczne adresy z pamięci RAM
+                vfs_mount_initrd(mod->mod_start, mod->mod_end);
+                printk("initrd: mounted successfully\n");
+            } else {
+                printk("initrd: no multiboot modules found!\n");
+            }
+        } else {
+            printk("initrd: multiboot flags say no modules present!\n");
+        }
+    } else {
+        printk("initrd: not booted by a multiboot compliant bootloader!\n");
+    }
 
     // Krok 1: Tekst powitalny
-    clear_screen(); // Opcjonalnie wyczyść ekran, by widzieć wszystko od góry
     printk("[nexus] kernel started. \n");
 
     _gdt_init();
@@ -610,50 +719,18 @@ void _start(uint32_t boot_magic, uint32_t boot_mbi_addr) {
     _pit_init(10000);
     printk("[nexus] init PIC remap.\n");
 
-    // --- PRZETWARZANIE INITRD (TERAZ PRZED STRONICOWANIEM) ---
-    if (boot_magic == 0x2BADB002) {
-        multiboot_info_t* mbi = (multiboot_info_t*)boot_mbi_addr;
-
-        // Bit 3 w mbi->flags informuje o obecności modułów
-        if (mbi->flags & (1 << 3)) {
-            if (mbi->mods_count > 0) {
-                multiboot_module_t* mod = (multiboot_module_t*)mbi->mods_addr;
-
-                // Montujemy system plików przekazując fizyczne adresy z pamięci RAM
-                vfs_mount_initrd(mod->mod_start, mod->mod_end);
-                printk("[nexus] InitRD mounted successfully from RAM!\n");
-
-                // --- TEST VFS ---
-                uint32_t test_size = 0;
-                char* test_data = vfs_read_file("hello.txt", &test_size);
-                if (test_data != 0) {
-                    printk("[VFS TEST] Zawartosc hello.txt: ");
-                    // Bezpieczne wypisanie zawartości pliku
-                    for(uint32_t j = 0; j < test_size; j++) {
-                        char tmp[2] = {test_data[j], '\0'};
-                        printk(tmp);
-                    }
-                    printk("\n");
-                } else {
-                    printk("[VFS TEST] Blad: Nie znaleziono pliku hello.txt w TAR!\n");
-                }
-            } else {
-                printk("[nexus] Warning: No multiboot modules found!\n");
-            }
-        } else {
-            printk("[nexus] Warning: Multiboot flags say no modules present!\n");
-        }
-    } else {
-        printk("[nexus] Warning: Not booted by a Multiboot compliant bootloader!\n");
-    }
-
+    // --- PRZETWARZANIE INITRD (TERAZ PRZED STRONICOWANIEM) --
     // Krok 3: Dopiero teraz, gdy skończyliśmy pracę z adresem z GRUB-a, bezpiecznie włączamy stronicowanie
     _paging_init();
     printk("[nexus] paging init\n");
 
-    // Tworzenie procesów (Twoje istniejące zadania)
-    _create_user_task(0, user_program_1);
-    _create_user_task(1, user_program_2);
+    // // Tworzenie procesów (Twoje istniejące zadania)
+    int loaded = _initrd_load_program(1, "./etc/testprog.bin");
+    if (!loaded) {
+         printk("Failed to load program from initrd. Creating fallback process.\n");
+         _create_user_task(1, user_program_1);  // zastępczy proces wbudowany
+    }
+    _create_user_task(0, user_program_2);
     _create_user_task(2, user_program_3);
 
     // Włączamy scheduler
@@ -670,4 +747,21 @@ void _start(uint32_t boot_magic, uint32_t boot_mbi_addr) {
     );
 
     while (1) {}
+}
+
+void _start() {
+    uint32_t eax_val;
+    uint32_t ebx_val;
+
+    __asm__ volatile (
+            "mov %%eax, %0"
+            : "=r" (eax_val) // Output operand
+        );
+    __asm__ volatile (
+            "mov %%ebx, %0"
+            : "=r" (ebx_val) // Output operand
+        );
+
+
+    kmain(eax_val,ebx_val);
 }

@@ -15,6 +15,7 @@ struct task {
     unsigned int kernel_stack;
     unsigned int sleep_ticks;
     unsigned int state;
+    int exit_code;
 } __attribute__((packed));
 
 // Zwraca nowy ESP (może być inny przy syscall_sleep)
@@ -24,6 +25,6 @@ unsigned int handle_syscall(struct registers *regs, unsigned int current_esp);
 void syscall_print(const char *msg);
 int  syscall_getpid(void);
 void syscall_sleep(int ticks);
-void syscall_exit();
+void syscall_exit(int exit_code);
 
 #endif

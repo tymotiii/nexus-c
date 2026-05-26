@@ -27,7 +27,7 @@ int.o: int.asm
 	nasm -f elf32 int.asm -o int.o
 
 # Budowanie samego pliku jądra
-$(TARGET): kernel.o idt.o int.o syshandler.o sysusrapi.o
+$(TARGET): $(OBJS)
 	$(LD) $(LDFLAGS) $(OBJS) -o $(TARGET)
 
 # Budowanie obrazu ISO (Główna, czysta reguła)
@@ -56,7 +56,7 @@ run: clean $(TARGET)
 	grub-mkrescue -o $(ISO_TARGET) iso
 	rm -rf iso
 	rm -f $(OBJS) $(TARGET) initrd.tar
-	qemu-system-x86_64 -cdrom os.iso -boot d
+	qemu-system-x86_64 -cdrom os.iso -boot d -m 1G
 
 debug: clean $(TARGET)
 	mkdir -p iso/boot/grub
@@ -68,4 +68,4 @@ debug: clean $(TARGET)
 	grub-mkrescue -o $(ISO_TARGET) iso
 	rm -rf iso
 	rm -f $(OBJS) initrd.tar
-	qemu-system-x86_64 -cdrom os.iso -boot d -S -s
+	qemu-system-x86_64 -cdrom os.iso -boot d -d int,cpu_reset -no-reboot -m 1G

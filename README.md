@@ -1,4 +1,14 @@
 # Nexus-C Kernel
+![GitHub repo size](https://img.shields.io/github/repo-size/tymotiii/nexus-c)
+![GitHub stars](https://img.shields.io/github/stars/tymotiii/nexus-c?style=social)
+![GitHub forks](https://img.shields.io/github/forks/tymotiii/nexus-c?style=social)
+![GitHub issues](https://img.shields.io/github/issues/tymotiii/nexus-c)
+![GitHub last commit](https://img.shields.io/github/last-commit/tymotiii/nexus-c)
+
+![Language](https://img.shields.io/github/languages/top/tymotiii/nexus-c)
+![Languages count](https://img.shields.io/github/languages/count/tymotiii/nexus-c)
+
+![License](https://img.shields.io/github/license/tymotiii/nexus-c)
 
 A simple hobby operating system kernel written in C.
 

@@ -9,6 +9,11 @@ struct registers {
     unsigned int eip, cs, eflags, useresp, ss;
 };
 
+#define STATE_FREE     0
+#define STATE_READY    1
+#define STATE_SLEEP    2
+#define STATE_BLOCKED  3
+
 struct task {
     unsigned int esp;
     unsigned int page_dir;

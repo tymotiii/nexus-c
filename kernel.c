@@ -1,17 +1,10 @@
 #include <stdint.h>
 #include "idt.h"
 #include "syscalls/syscalls.h"
+#include "video.h"
+#include "user_link.h"
 
-#define WIDTH 80
-#define HEIGHT 25
-static int cursor = 0;
-
-__attribute__((section(".multiboot"), used))
-unsigned int multiboot_header[] = {
-    0x1BADB002,
-    0x00000003,
-    (unsigned int)(-(0x1BADB002 + 0x00000003))
-};
+#define USER_SLOT_SIZE 8192u
 
 void outb(unsigned short port, unsigned char data) {
     __asm__ volatile (
@@ -40,11 +33,23 @@ static int kbd_head = 0;
 static int kbd_tail = 0;
 
 // Funkcja dodająca znak do bufora (wywoływana przez przerwanie)
+extern volatile int total_tasks;
+extern volatile struct task process_table[64];
+
+static void kbd_wake_blocked_tasks(void) {
+    for (int i = 0; i < total_tasks; i++) {
+        if (process_table[i].state == STATE_BLOCKED) {
+            process_table[i].state = STATE_READY;
+        }
+    }
+}
+
 void kbd_putc(char c) {
     int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
     if (next != kbd_tail) { // Jeśli bufor nie jest pełny
         kbd_buffer[kbd_head] = c;
         kbd_head = next;
+        kbd_wake_blocked_tasks();
     }
 }
 
@@ -54,69 +59,6 @@ char kbd_getc() {
     char c = kbd_buffer[kbd_tail];
     kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
     return c;
-}
-
-volatile char *video = (volatile char*)0xB8000;
-volatile char last_char = 0;
-
-char _getch() {
-    while (last_char == 0) {
-        __asm__ volatile("hlt");
-    }
-    char c = last_char;
-    last_char = 0;
-    return c;
-}
-
-void _terminal_set_cursor (int poss) {
-    uint16_t pos = poss;
-    outb(0x3D4, 0x0F);
-    outb(0x3D5, (uint8_t) (pos & 0xFF));
-    outb(0x3D4, 0x0E);
-    outb(0x3D5, (uint8_t) ((pos >> 8) & 0xFF));
-}
-
-void clear_screen() {
-    for (int i = 0; i < (WIDTH * HEIGHT); i++) {
-        video[i] = 0x00;
-        video[i+1] = 0x00;
-    }
-}
-
-
-void _scroll() {
-    for (int y = 1; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            int dest_idx = ((y - 1) * WIDTH + x) * 2;
-            int src_idx  = (y * WIDTH + x) * 2;
-            video[dest_idx]     = video[src_idx];
-            video[dest_idx + 1] = video[src_idx + 1];
-        }
-    }
-
-    int last_row_start = (HEIGHT - 1) * WIDTH;
-    for (int x = 0; x < WIDTH; x++) {
-        int idx = (last_row_start + x) * 2;
-        video[idx]     = ' ';
-        video[idx + 1] = 0x07;
-    }
-    cursor = last_row_start;
-}
-
-void printk(const char *txt) {
-    for (int i = 0; txt[i] != '\0'; i++) {
-        if (cursor >= (WIDTH * HEIGHT)) {
-            _scroll();
-        }
-        if (txt[i] == '\n') {
-            cursor = ((cursor / WIDTH) + 1) * WIDTH;
-            continue;
-        }
-        video[cursor * 2] = txt[i];
-        video[cursor * 2 + 1] = 0x07;
-        cursor++;
-    }
-    _terminal_set_cursor(cursor);
 }
 
 // -------[STRUKTURA REJESTRÓW]-------
@@ -435,9 +377,6 @@ volatile int total_tasks = 0;
 volatile struct task process_table[64];
 volatile int current_task_id = 0;
 volatile int scheduler_enabled = 0;
-#define STATE_FREE    0  // Pusty slot w process_table, można tu stworzyć nowy proces
-#define STATE_READY   1  // Proces żyje i chce działać (lub aktualnie działa)
-#define STATE_SLEEP   2
 uint8_t global_task_code_buffers[64][8192]   __attribute__((aligned(4096)));
 uint8_t global_task_kernel_stacks[64][4096] __attribute__((aligned(4096)));
 uint8_t global_task_user_stacks[64][4096]   __attribute__((aligned(4096)));
@@ -502,8 +441,10 @@ int _initrd_load_program(int id, const char* filename) {
         global_task_code_buffers[id][i] = (uint8_t)file_data[i];
     }
 
-    // Punktem wejścia (EIP) dla procesora będzie fizyczny adres początku tego bufora
-    unsigned int entry_point = (unsigned int)&global_task_code_buffers[id][0];
+    unsigned int phys_base = (unsigned int)&global_task_code_buffers[id][0];
+    unsigned int entry_point = USER_CODE_BASE + (unsigned int)id * USER_SLOT_SIZE;
+
+    paging_map_region(entry_point, phys_base, USER_SLOT_SIZE);
 
     // 3. Budowanie kontekstu rejestrów na globalnym stosie jądra
     // Rozmiar stosu jądra to 4096 bajtów, najwyższy wyrównany adres to indeks 4092
@@ -511,7 +452,7 @@ int _initrd_load_program(int id, const char* filename) {
 
     // Kontekst dla instrukcji IRET (powrót do Ring 3)
     *(--stack) = 0x23;                                  // SS użytkownika (Dane Ring 3)
-    *(--stack) = entry_point + 8188;                    // ESP użytkownika (Koniec zmapowanego bufora kodu)
+    *(--stack) = entry_point + USER_SLOT_SIZE - 4;       // ESP użytkownika (koniec slotu)
     *(--stack) = 0x202;                                 // EFLAGS: IF=1 (Włączone przerwania)
     *(--stack) = 0x1B;                                  // CS użytkownika (Kod Ring 3)
     *(--stack) = entry_point;                           // EIP zadania (Początek załadowanego kodu)
@@ -634,9 +575,6 @@ unsigned int interrupt_handler(struct registers *regs) {
                 if (c > 0) {
                     // 1. Zapisz znak do bufora jądra, żeby sys_read mógł go pobrać
                     kbd_putc(c);
-
-                    // 2. Opcjonalnie: echo (wypisz znak na ekran, żeby użytkownik widział co pisze)
-                    char str[2] = {c, '\0'};
                 }
             }
             outb(0x20, 0x20);
@@ -684,6 +622,7 @@ extern void pop_and_iret();
 
 // ZMIANA: Zmieniamy sygnaturę _start, aby GRUB podawał parametry bezpośrednio na stosie
 void kmain(uint32_t boot_magic, uint32_t boot_mbi_addr) {
+    video_init(boot_magic, boot_mbi_addr);
 
     if (boot_magic == 0x36d76289 || boot_magic == 0x2BADB002) {
         multiboot_info_t* mbi = (multiboot_info_t*)boot_mbi_addr;
@@ -706,8 +645,7 @@ void kmain(uint32_t boot_magic, uint32_t boot_mbi_addr) {
         printk("initrd: not booted by a multiboot compliant bootloader!\n");
     }
 
-    // Krok 1: Tekst powitalny
-    printk("[nexus] kernel started. \n");
+    printk("[nexus] kernel started.\n");
 
     _gdt_init();
     printk("[nexus] init GDT table. \n");
@@ -724,44 +662,35 @@ void kmain(uint32_t boot_magic, uint32_t boot_mbi_addr) {
     _paging_init();
     printk("[nexus] paging init\n");
 
-    // // Tworzenie procesów (Twoje istniejące zadania)
-    int loaded = _initrd_load_program(1, "./etc/testprog.bin");
-    if (!loaded) {
-         printk("Failed to load program from initrd. Creating fallback process.\n");
-         _create_user_task(1, user_program_1);  // zastępczy proces wbudowany
+    video_activate_after_paging();
+    if (video_is_graphics()) {
+        printk("[nexus] graphics mode (framebuffer)\n");
+    } else {
+        printk("[nexus] text mode (VGA fallback)\n");
     }
-    _create_user_task(0, user_program_2);
-    _create_user_task(2, user_program_3);
 
-    // Włączamy scheduler
+    int boot_task_id = 0;
+    int loaded = _initrd_load_program(1, "./etc/testprog.bin");
+    if (loaded) {
+        boot_task_id = 1;
+    } else {
+        printk("Failed to load program from initrd. Creating fallback process.\n");
+        _create_user_task(1, user_program_1);
+        boot_task_id = 1;
+        _create_user_task(0, user_program_2);
+        _create_user_task(2, user_program_3);
+    }
+
+    current_task_id = boot_task_id;
     scheduler_enabled = 1;
+    tss_entry.esp0 = process_table[boot_task_id].kernel_stack;
 
-    // Ustawiamy esp0 w TSS na stos pierwszego procesu
-    tss_entry.esp0 = process_table[0].kernel_stack;
-
-    // Skok do pierwszego procesu
     __asm__ volatile(
         "mov %0, %%esp\n"
         "jmp pop_and_iret\n"
-        : : "r"(process_table[0].esp)
+        : : "r"(process_table[boot_task_id].esp)
     );
 
     while (1) {}
 }
 
-void _start() {
-    uint32_t eax_val;
-    uint32_t ebx_val;
-
-    __asm__ volatile (
-            "mov %%eax, %0"
-            : "=r" (eax_val) // Output operand
-        );
-    __asm__ volatile (
-            "mov %%ebx, %0"
-            : "=r" (ebx_val) // Output operand
-        );
-
-
-    kmain(eax_val,ebx_val);
-}

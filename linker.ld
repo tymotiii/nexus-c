@@ -2,16 +2,33 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* GRUB ładuje jądro od adresu 1 MB */
     . = 1M;
 
-    .text :
-    {
-        *(.multiboot)   /* Nagłówek ląduje PIERWSZY */
-        *(.text)        /* Potem właściwy kod funkcji */
-        *(.rodata*)     /* Tutaj trafiają teksty w cudzysłowach, np. "Siemanko..." */
+    /* Must be in the first 8 KiB of the loaded image (before .eh_frame etc.) */
+    .multiboot ALIGN(4) : {
+        KEEP(*(.multiboot))
     }
 
-    .data : { *(.data) }
-    .bss  : { *(.bss) }
+    .text ALIGN(4) : {
+        *(.text)
+    }
+
+    .rodata ALIGN(4) : {
+        *(.rodata*)
+    }
+
+    .data ALIGN(4) : {
+        *(.data)
+    }
+
+    .bss ALIGN(4) : {
+        *(COMMON)
+        *(.bss)
+    }
+
+    /DISCARD/ : {
+        *(.eh_frame)
+        *(.comment)
+        *(.note*)
+    }
 }

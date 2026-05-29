@@ -78,10 +78,10 @@ isr_common_stub:
 
 ; --- TUTAJ SKACZEMY PRZY PIERWSZYM URUCHOMIENIU ---
 pop_and_iret:
-    pop ds
-    pop es
-    pop fs
     pop gs
+    pop fs
+    pop es
+    pop ds
 
     popad
     add esp, 8

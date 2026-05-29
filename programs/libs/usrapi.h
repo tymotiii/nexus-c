@@ -53,15 +53,17 @@ static inline void syscall_exit(int exit_code) {
     );
 }
 
-static inline char syscall_read() {
-    char c;
-    __asm__ volatile (
-        "int $0x80"          // Wywołanie przerwania syscalla jądra
-        : "=a"(c)            // OUTPUT: weź wartość z rejestru EAX i zapisz do zmiennej 'c'
-        : "a"(2)             // INPUT: wpisz numer syscalla (2 = SYS_READ) do rejestru EAX
-        : "memory"           // Poinformuj kompilator, że pamięć mogła ulec zmianie
+static inline char syscall_read(void) {
+    unsigned char c = 0;
+    __asm__ volatile(
+        "movl $5, %%eax\n"
+        "int $0x80\n"
+        "movb %%al, %0"
+        : "=m"(c)
+        :
+        : "eax", "memory"
     );
-    return c;
+    return (char)c;
 }
 
 

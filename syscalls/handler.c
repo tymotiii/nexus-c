@@ -17,27 +17,38 @@ extern void outb(unsigned short port, unsigned char data);
 extern unsigned char inb(unsigned short port);
 extern uint8_t global_task_code_buffers[64][8192];
 extern char kbd_getc();
-#define STATE_FREE    0  // Pusty slot w process_table, można tu stworzyć nowy proces
-#define STATE_READY   1  // Proces żyje i chce działać (lub aktualnie działa)
-#define STATE_SLEEP   2
+static unsigned int schedule_next_ready(void) {
+    int next_task_id = current_task_id;
+    for (int i = 0; i < total_tasks; i++) {
+        next_task_id = (next_task_id + 1) % total_tasks;
+        if (process_table[next_task_id].state == STATE_READY) {
+            current_task_id = next_task_id;
+            return process_table[current_task_id].esp;
+        }
+    }
+
+    while (1) {
+        __asm__ volatile("sti; hlt");
+        for (int i = 0; i < total_tasks; i++) {
+            if (process_table[i].state == STATE_READY) {
+                current_task_id = i;
+                return process_table[i].esp;
+            }
+        }
+    }
+}
 
 unsigned int handle_syscall(struct registers *regs, unsigned int current_esp) {
 
-    // syscall 1: print
-    if (regs->eax == 1) { // Twój numerek syscall_print
-            char* user_ptr = (char*)regs->ebx;   // To jest np. 0x00000004
+    // syscall 1: print string (ebx = pointer inside the running process address space)
+    if (regs->eax == 1) {
+            printk((char *)regs->ebx);
+        }
 
-            // Sprawdzamy, czy proces pochodzi z InitRD (id > 0, załóżmy że proces 0 to jądro/kmain)
-            if (current_task_id > 0) {
-                // OBLICZAMY REALNY ADRES W PAMIĘCI:
-                // Baza bufora tego procesu w jądru + offset przekazany przez użytkownika
-                char* real_kernel_ptr = (char*)((unsigned int)&global_task_code_buffers[current_task_id][0] + (unsigned int)user_ptr);
-
-                printk(real_kernel_ptr);
-            } else {
-                // Jeśli to wywołanie z jądra (które mapuje 1:1), drukuj normalnie
-                printk(user_ptr);
-            }
+    // syscall 6: print one character (ebx = byte)
+    else if (regs->eax == 6) {
+            char buf[2] = {(char)(regs->ebx & 0xFF), '\0'};
+            printk(buf);
         }
 
     // syscall 2: getpid
@@ -108,35 +119,19 @@ unsigned int handle_syscall(struct registers *regs, unsigned int current_esp) {
             return process_table[current_task_id].esp;
         }
     else if (regs->eax == 5) {
-        // Sprawdzamy czy w buforze jest jakiś znak
-                char c = kbd_getc();
+        char c = kbd_getc();
 
-                if (c == 0) {
-                    // Brak znaków! Proces musi poczekać.
-                    // Cofamy EIP o 2 bajty (rozmiar instrukcji `int $0x80`),
-                    // dzięki czemu po obudzeniu proces ponowi to samo żądanie syscalla!
-                    regs->eip -= 2;
+        if (c == 0) {
+            // Brak znaków: ponów ten sam int $0x80 po obudzeniu.
+            regs->eip -= 2;
+            process_table[current_task_id].esp = current_esp;
+            process_table[current_task_id].state = STATE_BLOCKED;
 
-                    // Zapisujemy obecny stan rejestrów
-                    process_table[current_task_id].esp = current_esp;
-
-                    // Oddajemy procesor: Szukamy następnego gotowego zadania (skrócony scheduler)
-                    int next_task_id = current_task_id;
-                    for (int i = 0; i < total_tasks; i++) {
-                        next_task_id = (next_task_id + 1) % total_tasks;
-                        if (process_table[next_task_id].state == STATE_READY) {
-                            current_task_id = next_task_id;
-                            break;
-                        }
-                    }
-
-                    // Ładujemy stos nowego procesu
-                    current_esp = process_table[current_task_id].esp;
-                }
-                else {
-                    // Znak jest dostępny! Zwracamy go do programu użytkownika przez rejestr EAX
-                    regs->eax = (unsigned int)c;
-                }
+            current_esp = schedule_next_ready();
+        } else {
+            process_table[current_task_id].state = STATE_READY;
+            regs->eax = (unsigned int)(unsigned char)c;
+        }
     }
 
     return current_esp;
